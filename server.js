@@ -49,8 +49,42 @@ const usersCollection = db.collection("users");
 // Створення індексів для оптимізації
 async function createIndexes() {
   try {
+    // Спочатку перевіряємо існуючі індекси
+    const existingIndexes = await usersCollection.indexes();
+    console.log("📋 Існуючі індекси:", existingIndexes.map(idx => idx.name));
+    
+    // Видаляємо проблемний індекс якщо він існує
+    try {
+      await usersCollection.dropIndex("authCodeHash_1");
+      console.log("🗑️ Видалено старий індекс authCodeHash_1");
+    } catch (dropError) {
+      // Індекс не існує - це нормально
+    }
+  } catch (error) {
+    console.log("⚠️ Помилка перевірки індексів:", error.message);
+  }
+  try {
+    // Спочатку очищуємо документи з null authCodeHash
+    const deleteResult = await usersCollection.deleteMany({ 
+      $or: [
+        { authCodeHash: null }, 
+        { authCodeHash: { $exists: false } }
+      ]
+    });
+    
+    if (deleteResult.deletedCount > 0) {
+      console.log(`🧹 Видалено ${deleteResult.deletedCount} документів з null authCodeHash`);
+    }
+    
     // Створюємо унікальний індекс для authCodeHash (первинний ключ)
-    await usersCollection.createIndex({ authCodeHash: 1 }, { unique: true });
+    // Використовуємо partial index щоб виключити null значення
+    await usersCollection.createIndex(
+      { authCodeHash: 1 }, 
+      { 
+        unique: true,
+        partialFilterExpression: { authCodeHash: { $ne: null } }
+      }
+    );
     
     // Створюємо індекс для username (унікальний)
     await usersCollection.createIndex({ username: 1 }, { unique: true });
@@ -64,6 +98,37 @@ async function createIndexes() {
     console.log("✅ Індекси створено успішно");
   } catch (error) {
     console.log("⚠️ Помилка створення індексів:", error.message);
+    
+    // Якщо все ще є проблема з дублікатами, виводимо більше інформації
+    if (error.code === 11000) {
+      console.log("🔍 Перевіряємо наявність дублікатів...");
+      
+      // Знаходимо документи з дублікатами authCodeHash
+      const duplicates = await usersCollection.aggregate([
+        { $group: { _id: "$authCodeHash", count: { $sum: 1 }, docs: { $push: "$_id" } } },
+        { $match: { count: { $gt: 1 } } }
+      ]).toArray();
+      
+      console.log("Знайдені дублікати:", duplicates);
+      
+      // Автоматично видаляємо дублікати (залишаємо тільки перший)
+      for (const duplicate of duplicates) {
+        const docsToDelete = duplicate.docs.slice(1); // Видаляємо всі крім першого
+        await usersCollection.deleteMany({ _id: { $in: docsToDelete } });
+        console.log(`🗑️ Видалено ${docsToDelete.length} дублікатів для authCodeHash: ${duplicate._id}`);
+      }
+      
+      // Спробуємо створити індекси знову
+      try {
+        await usersCollection.createIndex({ authCodeHash: 1 }, { unique: true });
+        await usersCollection.createIndex({ username: 1 }, { unique: true });
+        await usersCollection.createIndex({ groupId: 1 });
+        await usersCollection.createIndex({ sessionToken: 1 }, { sparse: true });
+        console.log("✅ Індекси створено успішно після очищення дублікатів");
+      } catch (retryError) {
+        console.log("❌ Не вдалося створити індекси навіть після очищення:", retryError.message);
+      }
+    }
   }
 }
 
