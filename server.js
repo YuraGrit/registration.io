@@ -44,22 +44,23 @@ app.use(cors({
 
 // Структура для користувача
 const db = client.db("Blockvote");
-const usersCollection = db.collection("users");
+const usersCollection = db.collection("users_v2"); // Нова колекція для нової структури
 
-// Створення індексів для оптимізації
+// In-memory кеш для швидкого пошуку останніх авторизацій
+const authCache = new Map();
+const CACHE_SIZE = 1000;
+
+// Створення індексів для максимальної швидкості
 async function createIndexes() {
   try {
-    // Створюємо унікальний індекс для authCodeHash (первинний ключ)
+    // Основний унікальний індекс - authCodeHash як первинний ключ
     await usersCollection.createIndex({ authCodeHash: 1 }, { unique: true });
     
-    // Створюємо індекс для username (унікальний)
+    // Додатковий індекс для username
     await usersCollection.createIndex({ username: 1 }, { unique: true });
     
-    // Створюємо індекс для groupId для швидкого пошуку по групах
+    // Індекс для groupId
     await usersCollection.createIndex({ groupId: 1 });
-    
-    // Створюємо індекс для sessionToken для швидкої перевірки авторизації
-    await usersCollection.createIndex({ sessionToken: 1 }, { sparse: true });
     
     console.log("✅ Індекси створено успішно");
   } catch (error) {
@@ -97,40 +98,51 @@ const authenticateToken = (req, res, next) => {
 // Генерація випадкового groupId
 const generateGroupId = () => crypto.randomBytes(4).toString('hex');
 
-// Покращена генерація коду авторизації з більшою складністю
+// Генерація ДУЖЕ складного коду авторизації
 const generateAuthCode = () => {
-  // Генеруємо випадкове число від 20 до 32 для довжини коду
-  const codeLength = Math.floor(Math.random() * 13) + 20;
+  // Довжина від 32 до 48 символів
+  const length = Math.floor(Math.random() * 17) + 32;
   
-  // Використовуємо комбінацію різних символів для більшої ентропії
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  // Використовуємо всі доступні символи ASCII для максимальної складності
+  const upperCase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const lowerCase = 'abcdefghijklmnopqrstuvwxyz';
   const numbers = '0123456789';
-  const special = '!@#$%^&*';
+  const special = '!@#$%^&*()_+-=[]{}|;:,.<>?~`';
+  
+  const allChars = upperCase + lowerCase + numbers + special;
   
   let code = '';
   
-  // Забезпечуємо присутність різних типів символів
-  code += chars[Math.floor(Math.random() * chars.length)]; // Літера
-  code += numbers[Math.floor(Math.random() * numbers.length)]; // Цифра
-  code += special[Math.floor(Math.random() * special.length)]; // Спецсимвол
+  // Забезпечуємо принаймні по одному символу кожного типу
+  code += upperCase[Math.floor(Math.random() * upperCase.length)];
+  code += lowerCase[Math.floor(Math.random() * lowerCase.length)];
+  code += numbers[Math.floor(Math.random() * numbers.length)];
+  code += special[Math.floor(Math.random() * special.length)];
   
   // Заповнюємо решту випадковими символами
-  const allChars = chars + numbers + special;
-  for (let i = 3; i < codeLength; i++) {
+  for (let i = 4; i < length; i++) {
     code += allChars[Math.floor(Math.random() * allChars.length)];
   }
   
-  // Перемішуємо символи для додаткової безпеки
+  // Перемішуємо символи
   return code.split('').sort(() => Math.random() - 0.5).join('');
 };
 
-// Функція для створення хешу коду авторизації
+// Швидке хешування
 const createAuthCodeHash = async (authCode) => {
-  // Використовуємо більш високий cost factor для безпеки
-  return await bcrypt.hash(authCode, 12);
+  return await bcrypt.hash(authCode, 10);
 };
 
-// Реєстрація користувача
+// Функція для очищення кешу
+const cleanCache = () => {
+  if (authCache.size > CACHE_SIZE) {
+    const entries = Array.from(authCache.entries());
+    const toDelete = entries.slice(0, Math.floor(CACHE_SIZE / 2));
+    toDelete.forEach(([key]) => authCache.delete(key));
+  }
+};
+
+// Реєстрація користувача (нова оптимізована структура)
 app.post('/register', async (req, res) => {
   const { username, status, groupId } = req.body;
 
@@ -139,39 +151,41 @@ app.post('/register', async (req, res) => {
   }
 
   try {
-    // Генерація коду авторизації
+    // Генерація складного коду
     const authCode = generateAuthCode();
     const authCodeHash = await createAuthCodeHash(authCode);
 
-    // За замовчуванням - звичайний користувач, якщо не вказано інше
     const userStatus = status === "admin" ? "admin" : "user";
-    
-    // Використовуємо переданий groupId або генеруємо новий
     const userGroupId = groupId || generateGroupId();
 
-    // Створення нового користувача з authCodeHash як первинним ключем
+    // НОВА СТРУКТУРА: authCodeHash як _id для максимальної швидкості
     const newUser = {
+      _id: authCodeHash, // Хеш коду як первинний ключ
       username,
-      authCodeHash, // Використовуємо як первинний ключ
       status: userStatus,
       groupId: userGroupId,
-      createdAt: new Date()
+      createdAt: new Date(),
+      lastLogin: null,
+      sessionToken: null
     };
 
     await usersCollection.insertOne(newUser);
+    
+    // Додаємо в кеш для швидкого доступу
+    authCache.set(authCodeHash, newUser);
+    cleanCache();
+    
     res.status(201).json({ 
       message: "Користувач зареєстрований!",
-      authCode, // Повертаємо нехешований код для входу
+      authCode,
       status: userStatus,
       groupId: userGroupId
     });
   } catch (error) {
     if (error.code === 11000) {
-      // Помилка дублювання ключа
-      if (error.keyPattern?.username) {
+      if (error.keyValue?.username) {
         return res.status(400).json({ message: "Користувач з таким іменем вже існує!" });
       }
-      // Якщо дублюється authCodeHash, генеруємо новий код
       return res.status(500).json({ message: "Помилка генерації коду, спробуйте ще раз" });
     }
     console.error("❌ Помилка при реєстрації:", error);
@@ -179,11 +193,10 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Масова реєстрація користувачів (оптимізована версія)
+// Масова реєстрація (оптимізована під нову структуру)
 app.post('/register-bulk', async (req, res) => {
   const { userCount } = req.body;
   
-  // Перевірка валідності параметрів
   if (!userCount || isNaN(userCount) || userCount < 1 || userCount > 100) {
     return res.status(400).json({ 
       message: "Некоректна кількість користувачів! Введіть число від 1 до 100." 
@@ -191,43 +204,45 @@ app.post('/register-bulk', async (req, res) => {
   }
   
   try {
-    // Створюємо новий groupId для групи
     const groupId = generateGroupId();
-    
-    // Масив для зберігання створених користувачів
     const users = [];
     const usersToReturn = [];
     
-    // Спочатку створюємо адміністратора
+    // Адміністратор
     const adminAuthCode = generateAuthCode();
     const adminAuthCodeHash = await createAuthCodeHash(adminAuthCode);
     
     const adminUser = {
+      _id: adminAuthCodeHash,
       username: `admin_${groupId.substring(0, 4)}`,
-      authCodeHash: adminAuthCodeHash,
       status: "admin",
       groupId,
-      createdAt: new Date()
+      createdAt: new Date(),
+      lastLogin: null,
+      sessionToken: null
     };
     
     users.push(adminUser);
+    authCache.set(adminAuthCodeHash, adminUser);
     
-    // Створюємо звичайних користувачів паралельно для швидкості
-    const userPromises = [];
-    for (let i = 0; i < userCount; i++) {
-      const promise = (async () => {
+    // Паралельне створення користувачів
+    const userPromises = Array.from({ length: userCount }, (_, i) => 
+      (async () => {
         const authCode = generateAuthCode();
         const authCodeHash = await createAuthCodeHash(authCode);
         
         const user = {
+          _id: authCodeHash,
           username: `user_${groupId.substring(0, 4)}_${i + 1}`,
-          authCodeHash,
           status: "user",
           groupId,
-          createdAt: new Date()
+          createdAt: new Date(),
+          lastLogin: null,
+          sessionToken: null
         };
         
-        // Додаємо до масиву для повернення
+        authCache.set(authCodeHash, user);
+        
         usersToReturn.push({
           username: user.username,
           authCode: authCode,
@@ -236,19 +251,17 @@ app.post('/register-bulk', async (req, res) => {
         });
         
         return user;
-      })();
-      
-      userPromises.push(promise);
-    }
+      })()
+    );
     
-    // Чекаємо завершення всіх промісів
     const regularUsers = await Promise.all(userPromises);
     users.push(...regularUsers);
     
-    // Вставляємо всіх користувачів в БД одним запитом
-    await usersCollection.insertMany(users);
+    // Одна вставка для всіх
+    await usersCollection.insertMany(users, { ordered: false });
     
-    // Повертаємо відповідь з кодами авторизації
+    cleanCache();
+    
     res.status(201).json({
       message: "Групу користувачів успішно створено!",
       groupId,
@@ -262,7 +275,7 @@ app.post('/register-bulk', async (req, res) => {
   }
 });
 
-// Оптимізована авторизація користувача за кодом
+// МАКСИМАЛЬНО ШВИДКА авторизація
 app.post('/login', async (req, res) => {
   const { authCode } = req.body;
 
@@ -271,24 +284,44 @@ app.post('/login', async (req, res) => {
   }
 
   try {
-    // Спочатку створюємо хеш з введеного коду
-    const authCodeHash = await bcrypt.hash(authCode, 12);
+    // Створюємо хеш з введеного коду
+    const authCodeHash = await bcrypt.hash(authCode, 10);
     
-    // Шукаємо користувача за хешем (використовуючи індекс)
-    let foundUser = await usersCollection.findOne({ authCodeHash });
+    let foundUser = null;
     
-    // Якщо не знайшли точний збіг хешу, шукаємо серед усіх користувачів
-    // (для сумісності зі старими записами)
+    // 1. Спочатку перевіряємо кеш (найшвидше)
+    if (authCache.has(authCodeHash)) {
+      foundUser = authCache.get(authCodeHash);
+    }
+    
+    // 2. Якщо не в кеші, то ПРЯМИЙ пошук по _id (найшвидший запит в MongoDB)
     if (!foundUser) {
-      const users = await usersCollection.find({}).toArray();
+      foundUser = await usersCollection.findOne({ _id: authCodeHash });
       
-      for (const user of users) {
-        if (user.authCodeHash) {
-          const isMatch = await bcrypt.compare(authCode, user.authCodeHash);
-          if (isMatch) {
-            foundUser = user;
-            break;
-          }
+      if (foundUser) {
+        // Додаємо в кеш для наступних разів
+        authCache.set(authCodeHash, foundUser);
+        cleanCache();
+      }
+    }
+    
+    // 3. Якщо і це не спрацювало, тоді перевіряємо bcrypt (для випадків коли хеші відрізняються)
+    if (!foundUser) {
+      // Отримуємо невелику кількість останніх користувачів
+      const recentUsers = await usersCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .limit(100)
+        .toArray();
+      
+      for (const user of recentUsers) {
+        const isMatch = await bcrypt.compare(authCode, user._id);
+        if (isMatch) {
+          foundUser = user;
+          // Оновлюємо кеш
+          authCache.set(user._id, user);
+          cleanCache();
+          break;
         }
       }
     }
@@ -297,23 +330,26 @@ app.post('/login', async (req, res) => {
       return res.status(401).json({ message: "Невірний код авторизації!" });
     }
 
-    // Генеруємо токен після успішної авторизації
+    // Генеруємо токен
     const token = jwt.sign({ 
       userId: foundUser._id,
-      status: foundUser.status || "user",
-      groupId: foundUser.groupId || generateGroupId() 
+      status: foundUser.status,
+      groupId: foundUser.groupId
     }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 
-    // Зберігаємо токен у БД
-    await usersCollection.updateOne(
-      { _id: foundUser._id },
-      { $set: { sessionToken: token, lastLogin: new Date() } }
-    );
+    // Оновлюємо в базі та кеші
+    const updateData = { sessionToken: token, lastLogin: new Date() };
+    await usersCollection.updateOne({ _id: foundUser._id }, { $set: updateData });
+    
+    // Оновлюємо кеш
+    foundUser.sessionToken = token;
+    foundUser.lastLogin = new Date();
+    authCache.set(foundUser._id, foundUser);
 
     return res.status(200).json({
       message: "Авторизація успішна!",
       token,
-      status: foundUser.status || "user",
+      status: foundUser.status,
       groupId: foundUser.groupId
     });
   } catch (error) {
@@ -327,7 +363,7 @@ app.get('/check-auth', authenticateToken, (req, res) => {
   res.status(200).json({ 
     message: 'Авторизація пройдена', 
     userId: req.user.userId,
-    status: req.user.status || "user",
+    status: req.user.status,
     groupId: req.user.groupId
   });
 });
@@ -335,16 +371,26 @@ app.get('/check-auth', authenticateToken, (req, res) => {
 // Отримання інформації про користувача
 app.get('/user', authenticateToken, async (req, res) => {
   try {
-    const user = await usersCollection.findOne({ _id: new ObjectId(req.user.userId) });
+    let user = null;
+    
+    // Спочатку перевіряємо кеш
+    if (authCache.has(req.user.userId)) {
+      user = authCache.get(req.user.userId);
+    } else {
+      user = await usersCollection.findOne({ _id: req.user.userId });
+      if (user) {
+        authCache.set(req.user.userId, user);
+        cleanCache();
+      }
+    }
 
     if (!user) {
       return res.status(404).json({ message: 'Користувач не знайдений' });
     }
 
-    // Відповідь з даними користувача (без конфіденційної інформації)
     res.status(200).json({
       username: user.username,
-      status: user.status || "user",
+      status: user.status,
       groupId: user.groupId,
       userId: req.user.userId
     });
@@ -358,19 +404,26 @@ app.get('/user', authenticateToken, async (req, res) => {
 app.get('/user-id', authenticateToken, (req, res) => {
   res.json({ 
     userId: req.user.userId,
-    status: req.user.status || "user",
+    status: req.user.status,
     groupId: req.user.groupId
   });
 });
 
 // Тестовий маршрут
 app.get('/test', (req, res) => {
-  res.send("Сервер працює!");
+  res.send("Швидкий сервер працює!");
+});
+
+// Очищення кешу при завершенні
+process.on('SIGINT', () => {
+  authCache.clear();
+  client.close();
+  process.exit(0);
 });
 
 // Запуск сервера
 connectToDatabase().then(() => {
   app.listen(port, () => {
-    console.log(`✅ Сервер аутентифікації запущено на порту ${port}`);
+    console.log(`✅ Максимально швидкий сервер запущено на порту ${port}`);
   });
 });
