@@ -50,6 +50,37 @@ const usersCollection = db.collection("users");
 const authCodeCache = new Map();
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 години
 
+// Функція завантаження кешу з БД при старті сервера
+async function loadCacheFromDB() {
+  try {
+    console.log("🔄 Завантаження кешу з бази даних...");
+    
+    // Отримуємо всіх користувачів за останні 24 години
+    const yesterday = new Date(Date.now() - CACHE_TTL);
+    const recentUsers = await usersCollection.find({
+      createdAt: { $gte: yesterday },
+      authCodeId: { $exists: true }
+    }, {
+      projection: { authCodeId: 1, authCodeHash: 1, createdAt: 1 }
+    }).toArray();
+    
+    console.log(`📦 Знайдено ${recentUsers.length} користувачів для кешування`);
+    
+    // Завантажуємо в кеш (без plaintextового коду, він недоступний)
+    for (const user of recentUsers) {
+      authCodeCache.set(user.authCodeId, {
+        authCodeHash: user.authCodeHash,
+        timestamp: user.createdAt.getTime(),
+        fromDB: true // Позначаємо що завантажено з БД
+      });
+    }
+    
+    console.log(`✅ Кеш завантажено: ${authCodeCache.size} записів`);
+  } catch (error) {
+    console.error("❌ Помилка завантаження кешу:", error);
+  }
+}
+
 // Функція очищення кешу від застарілих записів
 setInterval(() => {
   const now = Date.now();
@@ -144,6 +175,7 @@ async function connectToDatabase() {
     await client.connect();
     console.log("✅ Підключено до MongoDB");
     await createIndexes();
+    await loadCacheFromDB(); // Завантажуємо кеш після підключення
   } catch (err) {
     console.log("❌ Помилка підключення до MongoDB", err);
   }
@@ -337,7 +369,7 @@ app.post('/register-bulk', async (req, res) => {
   }
 });
 
-// КАРДИНАЛЬНО оптимізована авторизація
+// МАКСИМАЛЬНО оптимізована авторизація
 app.post('/login', async (req, res) => {
   const { authCode } = req.body;
 
@@ -349,7 +381,7 @@ app.post('/login', async (req, res) => {
     let foundUser = null;
     let matchedAuthCodeId = null;
 
-    // Спочатку шукаємо в кеші (найшвидший спосіб)
+    // 1. Спочатку шукаємо прямий збіг в кеші (для свіжих користувачів)
     for (const [authCodeId, cacheData] of authCodeCache.entries()) {
       if (cacheData.authCode === authCode) {
         matchedAuthCodeId = authCodeId;
@@ -362,21 +394,50 @@ app.post('/login', async (req, res) => {
       foundUser = await usersCollection.findOne({ authCodeId: matchedAuthCodeId });
     }
 
-    // Якщо не знайшли в кеші, шукаємо в базі даних (fallback)
+    // 2. Якщо не знайшли прямий збіг, перевіряємо хеші в кеші
     if (!foundUser) {
-      // Отримуємо всіх користувачів за один запит з проекцією
-      const users = await usersCollection.find({}, {
-        projection: { authCodeHash: 1, username: 1, status: 1, groupId: 1 }
+      for (const [authCodeId, cacheData] of authCodeCache.entries()) {
+        if (cacheData.fromDB && cacheData.authCodeHash) {
+          const isMatch = await bcrypt.compare(authCode, cacheData.authCodeHash);
+          if (isMatch) {
+            foundUser = await usersCollection.findOne({ authCodeId });
+            break;
+          }
+        }
+      }
+    }
+
+    // 3. Останній шанс - повний пошук в БД (рідкісний випадок)
+    if (!foundUser) {
+      console.log("⚠️ Повний пошук в БД (повільний)");
+      
+      // Оптимізований запит з лімітом та сортуванням
+      const users = await usersCollection.find({
+        authCodeHash: { $exists: true, $ne: null }
+      }, {
+        projection: { authCodeHash: 1, username: 1, status: 1, groupId: 1, authCodeId: 1 },
+        sort: { createdAt: -1 }, // Спочатку нові користувачі
+        limit: 1000 // Обмежуємо пошук
       }).toArray();
       
-      // Перевіряємо паралельно (але обмежуємо кількість одночасних операцій)
-      const batchSize = 10;
+      // Пакетна перевірка з обмеженою кількістю одночасних операцій
+      const batchSize = 5; // Зменшуємо для економії ресурсів
       for (let i = 0; i < users.length; i += batchSize) {
         const batch = users.slice(i, i + batchSize);
         const promises = batch.map(async (user) => {
           if (user.authCodeHash) {
             const isMatch = await bcrypt.compare(authCode, user.authCodeHash);
-            return isMatch ? user : null;
+            if (isMatch) {
+              // Додаємо знайденого користувача в кеш
+              if (user.authCodeId) {
+                authCodeCache.set(user.authCodeId, {
+                  authCodeHash: user.authCodeHash,
+                  timestamp: Date.now(),
+                  fromDB: true
+                });
+              }
+              return user;
+            }
           }
           return null;
         });
@@ -417,13 +478,38 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// Перевірка авторизації
+// Перевірка авторизації (залишаємо для сумісності)
 app.get('/check-auth', authenticateToken, (req, res) => {
   res.status(200).json({ 
     message: 'Авторизація пройдена', 
     userId: req.user.userId,
     status: req.user.status || "user",
     groupId: req.user.groupId
+  });
+});
+
+// Додатковий endpoint для перевірки стану авторизації (швидкий)
+app.get('/auth-status', authenticateToken, (req, res) => {
+  // Швидкий endpoint без запитів до БД
+  res.status(200).json({ 
+    authenticated: true,
+    userId: req.user.userId,
+    status: req.user.status || "user",
+    groupId: req.user.groupId
+  });
+});
+
+// Endpoint для отримання статистики кешу (для відладки)
+app.get('/cache-stats', (req, res) => {
+  const cacheSize = authCodeCache.size;
+  const fromDB = Array.from(authCodeCache.values()).filter(v => v.fromDB).length;
+  const fresh = cacheSize - fromDB;
+  
+  res.json({
+    totalCached: cacheSize,
+    fromDatabase: fromDB,
+    freshRegistrations: fresh,
+    message: `Кеш: ${cacheSize} записів (${fresh} нових, ${fromDB} з БД)`
   });
 });
 
