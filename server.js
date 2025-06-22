@@ -47,6 +47,12 @@ async function connectToDatabase() {
   try {
     await client.connect();
     console.log("✅ Підключено до MongoDB");
+    
+    // Створюємо індекс для швидшого пошуку по authCodeHash
+    const db = client.db("Blockvote");
+    const usersCollection = db.collection("users");
+    await usersCollection.createIndex({ "authCodeHash": 1 });
+    console.log("✅ Індекс для authCodeHash створено");
   } catch (err) {
     console.log("❌ Помилка підключення до MongoDB", err);
   }
@@ -75,22 +81,28 @@ const authenticateToken = (req, res, next) => {
 // Генерація випадкового groupId
 const generateGroupId = () => crypto.randomBytes(4).toString('hex');
 
-// Генерація випадкового коду для авторизації
+// Генерація складнішого коду для авторизації
 const generateAuthCode = () => {
-  // Генеруємо 8 байтів
-  const hexCode = crypto.randomBytes(8).toString('hex');
+  // Генеруємо базовий код з hex символів
+  const hexPart = crypto.randomBytes(12).toString('hex'); // 24 символи
   
-  // Генеруємо випадкове число від 15 до 20 для довжини коду
-  const codeLength = Math.floor(Math.random() * 6) + 15;
+  // Додаємо спеціальні символи для складності
+  const specialChars = '!@#$%^&*';
+  const randomSpecial = specialChars[Math.floor(Math.random() * specialChars.length)];
   
-  // Обрізаємо або доповнюємо код до потрібної довжини
-  if (hexCode.length >= codeLength) {
-    return hexCode.substring(0, codeLength);
-  } else {
-    // Якщо потрібно більше символів, додаємо ще випадкових
-    const additionalChars = crypto.randomBytes(10).toString('hex');
-    return hexCode + additionalChars.substring(0, codeLength - hexCode.length);
-  }
+  // Генеруємо випадкове число від 20 до 28 для довжини коду
+  const codeLength = Math.floor(Math.random() * 9) + 20;
+  
+  // Комбінуємо все разом
+  let fullCode = hexPart + randomSpecial + crypto.randomBytes(8).toString('hex');
+  
+  // Обрізаємо до потрібної довжини
+  return fullCode.substring(0, codeLength);
+};
+
+// Функція для створення хешу коду (для швидкого пошуку)
+const createAuthCodeHash = (authCode) => {
+  return crypto.createHash('sha256').update(authCode).digest('hex');
 };
 
 // Реєстрація користувача
@@ -111,9 +123,10 @@ app.post('/register', async (req, res) => {
       });
     }
     
-    // Генерація випадкового коду для авторизації
+    // Генерація складнішого коду для авторизації
     const authCode = generateAuthCode();
     const hashedAuthCode = await bcrypt.hash(authCode, 10);
+    const authCodeHash = createAuthCodeHash(authCode);
 
     // За замовчуванням - звичайний користувач, якщо не вказано інше
     const userStatus = status === "admin" ? "admin" : "user";
@@ -125,6 +138,7 @@ app.post('/register', async (req, res) => {
     const newUser = {
       username,
       authCode: hashedAuthCode,
+      authCodeHash, // Додаємо хеш для швидкого пошуку
       status: userStatus,
       groupId: userGroupId,
       createdAt: new Date()
@@ -143,7 +157,7 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Масова реєстрація користувачів (новий ендпоінт)
+// Масова реєстрація користувачів (оновлений ендпоінт)
 app.post('/register-bulk', async (req, res) => {
   const { userCount } = req.body;
   
@@ -164,10 +178,12 @@ app.post('/register-bulk', async (req, res) => {
     // Спочатку створюємо адміністратора
     const adminAuthCode = generateAuthCode();
     const adminHashedAuthCode = await bcrypt.hash(adminAuthCode, 10);
+    const adminAuthCodeHash = createAuthCodeHash(adminAuthCode);
     
     const adminUser = {
       username: `admin_${groupId.substring(0, 4)}`,
       authCode: adminHashedAuthCode,
+      authCodeHash: adminAuthCodeHash,
       status: "admin",
       groupId,
       createdAt: new Date()
@@ -180,10 +196,12 @@ app.post('/register-bulk', async (req, res) => {
     for (let i = 0; i < userCount; i++) {
       const authCode = generateAuthCode();
       const hashedAuthCode = await bcrypt.hash(authCode, 10);
+      const authCodeHash = createAuthCodeHash(authCode);
       
       const user = {
         username: `user_${groupId.substring(0, 4)}_${i + 1}`,
         authCode: hashedAuthCode,
+        authCodeHash,
         status: "user",
         groupId,
         createdAt: new Date()
@@ -192,7 +210,6 @@ app.post('/register-bulk', async (req, res) => {
       // Зберігаємо незахешований код для повернення клієнту
       user.originalAuthCode = authCode;
       users.push(user);
-  
     }
     
     // Підготовлюємо користувачів для вставки в БД (без originalAuthCode)
@@ -226,7 +243,7 @@ app.post('/register-bulk', async (req, res) => {
   }
 });
 
-// Авторизація користувача за кодом
+// ОПТИМІЗОВАНА авторизація користувача за кодом
 app.post('/login', async (req, res) => {
   const { authCode } = req.body;
 
@@ -235,25 +252,21 @@ app.post('/login', async (req, res) => {
   }
 
   try {
-    // Отримуємо всіх користувачів для пошуку збігу коду авторизації
-    const users = await usersCollection.find({}).toArray();
-
-    // Шукаємо користувача з відповідним кодом
-    let foundUser = null;
+    // Створюємо хеш з переданого коду для швидкого пошуку
+    const authCodeHash = createAuthCodeHash(authCode);
     
-    for (const user of users) {
-      // Перевіряємо, чи є у користувача поле authCode
-      if (user.authCode) {
-        // Порівнюємо хеші
-        const isMatch = await bcrypt.compare(authCode, user.authCode);
-        if (isMatch) {
-          foundUser = user;
-          break;
-        }
-      }
+    // Швидкий пошук по індексу замість перебору всіх користувачів
+    const foundUser = await usersCollection.findOne({ authCodeHash });
+    
+    if (!foundUser) {
+      // Швидка відповідь при невірному коді - без bcrypt порівняння
+      return res.status(401).json({ message: "Невірний код авторизації!" });
     }
 
-    if (!foundUser) {
+    // Перевіряємо bcrypt хеш тільки для знайденого користувача
+    const isMatch = await bcrypt.compare(authCode, foundUser.authCode);
+    
+    if (!isMatch) {
       return res.status(401).json({ message: "Невірний код авторизації!" });
     }
 
