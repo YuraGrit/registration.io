@@ -81,23 +81,39 @@ const authenticateToken = (req, res, next) => {
 // Генерація випадкового groupId
 const generateGroupId = () => crypto.randomBytes(4).toString('hex');
 
-// Генерація складнішого коду для авторизації
+// Покращена генерація складного коду для авторизації
 const generateAuthCode = () => {
-  // Генеруємо базовий код з hex символів
-  const hexPart = crypto.randomBytes(12).toString('hex'); // 24 символи
+  // Використовуємо різні набори символів для максимальної ентропії
+  const uppercase = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const lowercase = 'abcdefghijklmnopqrstuvwxyz';
+  const numbers = '0123456789';
+  const specialChars = '!@#$%^&*()_+-=[]{}|;:,.<>?';
   
-  // Додаємо спеціальні символи для складності
-  const specialChars = '!@#$%^&*';
-  const randomSpecial = specialChars[Math.floor(Math.random() * specialChars.length)];
+  // Генеруємо випадкову довжину коду від 24 до 32 символів
+  const codeLength = Math.floor(Math.random() * 9) + 24;
   
-  // Генеруємо випадкове число від 20 до 28 для довжини коду
-  const codeLength = Math.floor(Math.random() * 9) + 20;
+  let authCode = '';
   
-  // Комбінуємо все разом
-  let fullCode = hexPart + randomSpecial + crypto.randomBytes(8).toString('hex');
+  // Забезпечуємо наявність принаймні одного символу з кожної категорії
+  authCode += uppercase[Math.floor(Math.random() * uppercase.length)];
+  authCode += lowercase[Math.floor(Math.random() * lowercase.length)];
+  authCode += numbers[Math.floor(Math.random() * numbers.length)];
+  authCode += specialChars[Math.floor(Math.random() * specialChars.length)];
   
-  // Обрізаємо до потрібної довжини
-  return fullCode.substring(0, codeLength);
+  // Заповнюємо решту коду випадковими символами
+  const allChars = uppercase + lowercase + numbers + specialChars;
+  
+  for (let i = 4; i < codeLength; i++) {
+    // Використовуємо crypto.randomBytes для кращої ентропії
+    const randomByte = crypto.randomBytes(1)[0];
+    authCode += allChars[randomByte % allChars.length];
+  }
+  
+  // Перемішуємо символи для додаткової безпеки
+  return authCode.split('').sort(() => {
+    const randomBytes = crypto.randomBytes(1)[0];
+    return randomBytes - 128;
+  }).join('');
 };
 
 // Функція для створення хешу коду (для швидкого пошуку)
